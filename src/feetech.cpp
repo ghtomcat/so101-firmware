@@ -41,6 +41,9 @@ static void send_packet(uint8_t id, uint8_t instr,
     if (param_len) _serial->write(params, param_len);
     _serial->write(chk);
     rx_mode();
+    // Drain TX echo (half-duplex TTL: RX sees every transmitted byte).
+    // Safe for RS-485 too — nothing to drain there.
+    while (_serial->available()) _serial->read();
 }
 
 // Returns number of data bytes in response, -1 on timeout/error.
@@ -136,24 +139,22 @@ bool feetech_ping(uint8_t id) {
 }
 
 bool feetech_write_pos(uint8_t id, uint16_t pos, uint16_t speed, uint8_t acc) {
-    // Write 8 bytes starting at REG_GOAL_ACC (41):
-    // [acc, 0, pos_l, pos_h, time_l=0, time_h=0, speed_l, speed_h]
-    uint8_t params[10];
-    params[0] = REG_GOAL_ACC;     // start address
+    // Write 7 bytes starting at REG_GOAL_ACC (41):
+    // 41=Acc  42-43=Goal_Pos  44-45=Goal_Time  46-47=Goal_Speed
+    uint8_t params[9];
+    params[0] = REG_GOAL_ACC;
     params[1] = acc;
-    params[2] = 0;                // padding register 42
-    params[3] = pos & 0xFF;
-    params[4] = (pos >> 8) & 0xFF;
-    params[5] = 0;                // time = 0 (speed mode)
-    params[6] = 0;
-    params[7] = speed & 0xFF;
-    params[8] = (speed >> 8) & 0xFF;
+    params[2] = pos & 0xFF;
+    params[3] = (pos >> 8) & 0xFF;
+    params[4] = 0;                    // Goal_Time_L = 0 (use speed mode)
+    params[5] = 0;                    // Goal_Time_H = 0
+    params[6] = speed & 0xFF;
+    params[7] = (speed >> 8) & 0xFF;
 
-    // WRITE_DATA: params = [start_addr, data...]
-    send_packet(id, INST_WRITE, params, 9);
+    send_packet(id, INST_WRITE, params, 8);
 
     uint8_t buf[4];
-    return recv_packet(id, buf) >= 0;
+    return recv_packet(id, buf, 20) >= 0;
 }
 
 bool feetech_read_state(uint8_t id, ServoState &out) {
@@ -180,26 +181,25 @@ bool feetech_sync_write_pos(const uint8_t *ids, const uint16_t *pos,
                              const uint16_t *speed, const uint8_t *acc,
                              uint8_t count) {
     // SYNC_WRITE: FF FF FE LEN 83 START DATA_LEN [ID DATA...]*n CHK
-    // DATA_LEN = 8 bytes per servo (see feetech_write_pos layout)
-    const uint8_t data_per_servo = 8;
-    // params = [start_addr, data_len, ID0, d0..d7, ID1, d0..d7, ...]
+    // DATA_LEN = 7 bytes per servo: acc, pos_l, pos_h, time_l, time_h, spd_l, spd_h
+    const uint8_t data_per_servo = 7;
+    // params = [start_addr, data_len, ID0, d0..d6, ID1, d0..d6, ...]
     int param_len = 2 + count * (1 + data_per_servo);
-    uint8_t params[2 + 6 * 9]; // max 6 servos
+    uint8_t params[2 + 6 * 8]; // max 6 servos
 
     params[0] = REG_GOAL_ACC;
     params[1] = data_per_servo;
 
     for (int i = 0; i < count; i++) {
-        uint8_t *p = &params[2 + i * 9];
+        uint8_t *p = &params[2 + i * 8];
         p[0] = ids[i];
         p[1] = acc[i];
-        p[2] = 0;
-        p[3] = pos[i] & 0xFF;
-        p[4] = (pos[i] >> 8) & 0xFF;
-        p[5] = 0;
-        p[6] = 0;
-        p[7] = speed[i] & 0xFF;
-        p[8] = (speed[i] >> 8) & 0xFF;
+        p[2] = pos[i] & 0xFF;
+        p[3] = (pos[i] >> 8) & 0xFF;
+        p[4] = 0;                       // Goal_Time_L = 0
+        p[5] = 0;                       // Goal_Time_H = 0
+        p[6] = speed[i] & 0xFF;
+        p[7] = (speed[i] >> 8) & 0xFF;
     }
 
     // SYNC_WRITE goes to broadcast ID (0xFE), no response expected.
@@ -226,6 +226,13 @@ bool feetech_sync_read_pos(const uint8_t *ids, uint16_t *pos, uint8_t count) {
         pos[i] = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
     }
     return true;
+}
+
+bool feetech_write_torque(uint8_t id, bool enable) {
+    uint8_t params[2] = {REG_TORQUE_EN, enable ? 1u : 0u};
+    send_packet(id, INST_WRITE, params, 2);
+    uint8_t buf[4];
+    return recv_packet(id, buf) >= 0;
 }
 
 bool feetech_torque_all(const uint8_t *ids, uint8_t count, bool enable) {

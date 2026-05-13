@@ -18,9 +18,9 @@
 // RAM register map (STS3215)
 #define REG_TORQUE_EN       40   // 1 byte  (1 = torque on, 0 = off)
 #define REG_GOAL_ACC        41   // 1 byte
-#define REG_GOAL_POS        43   // 2 bytes (L then H)
-#define REG_GOAL_TIME       45   // 2 bytes (0 = use speed mode)
-#define REG_GOAL_SPEED      47   // 2 bytes
+#define REG_GOAL_POS        42   // 2 bytes (L then H)  — immediately follows Acc
+#define REG_GOAL_TIME       44   // 2 bytes (0 = use speed mode)
+#define REG_GOAL_SPEED      46   // 2 bytes
 #define REG_PRESENT_POS     56   // 2 bytes
 #define REG_PRESENT_SPEED   58   // 2 bytes  (bit15 = direction)
 #define REG_PRESENT_LOAD    60   // 2 bytes  (bit15 = direction)
@@ -59,6 +59,9 @@ bool feetech_sync_write_pos(const uint8_t *ids, const uint16_t *pos,
 
 // Read present positions for `count` servos. pos[] receives raw values.
 bool feetech_sync_read_pos(const uint8_t *ids, uint16_t *pos, uint8_t count);
+
+// Enable or disable torque on a single servo with verified WRITE (expects ACK).
+bool feetech_write_torque(uint8_t id, bool enable);
 
 // Enable or disable torque on a set of servos via a single SYNC_WRITE.
 // Pass enable=false for an immediate, bus-level emergency stop.

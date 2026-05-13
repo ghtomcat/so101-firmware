@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Discover Feetech servos on an SO-101 arm via the ESP32 WebSocket.
+Discover and calibrate Feetech servos on an SO-101 arm via the ESP32 WebSocket.
 No external dependencies — Python stdlib only.
 
 Usage:
     python3 tools/discover.py 192.168.1.100
+    python3 tools/discover.py 192.168.1.100 --debug
+    python3 tools/discover.py 192.168.1.100 --calibrate 4
+    python3 tools/discover.py 192.168.1.100 --calibrate 4 5 6
 """
 
 import argparse
@@ -142,6 +145,60 @@ def discover(ip: str, port: int = 80, debug: bool = False) -> None:
         sock.close()
 
 
+def calibrate(ip: str, port: int, ids: list[int]) -> None:
+    url = f"ws://{ip}:{port}/ws"
+    print(f"Connecting to {url} ...")
+
+    try:
+        sock = ws_connect(ip, port)
+    except (OSError, ConnectionError) as e:
+        sys.exit(f"Connection failed: {e}")
+
+    try:
+        welcome = json.loads(ws_recv(sock))
+        print(f"Connected  joints={welcome.get('joints', '?')}\n")
+        print("Make sure the arm can move freely through its full range.\n")
+
+        any_ok = False
+        for sid in ids:
+            print(f"Calibrating servo {sid} — sweeping to end stops …", flush=True)
+            ws_send(sock, json.dumps({
+                "cmd":         "calibrate",
+                "id":          sid,
+                "speed":       400,
+                "margin_deg":  5.0,
+                "load_thresh": 400,
+                "timeout_ms":  15000,
+            }))
+
+            sock.settimeout(40)
+            while True:
+                r = json.loads(ws_recv(sock))
+                if "type" not in r:  # skip telemetry + alert broadcasts
+                    break
+            sock.settimeout(None)
+
+            if not r.get("ok"):
+                print(f"  ID {sid}: FAILED — {r.get('err', r)}")
+            else:
+                any_ok = True
+                print(
+                    f"  ID {sid}: OK  center={r['center']}  "
+                    f"range={r['range_deg']}°  "
+                    f"[{r['min_deg']}° … {r['max_deg']}°]"
+                )
+
+        if any_ok:
+            print("\nCalibration saved to NVS.")
+        else:
+            print("\nNo servos calibrated successfully.")
+
+    except (ConnectionError, json.JSONDecodeError) as e:
+        sys.exit(f"Error: {e}")
+    finally:
+        sock.close()
+
+
 def _debug_scan(sock) -> None:
     print("Running bus diagnostic (debug_scan) …\n")
     ws_send(sock, json.dumps({"cmd": "debug_scan"}))
@@ -188,8 +245,14 @@ def main() -> None:
                         help="WebSocket port (default: 80)")
     parser.add_argument("--debug", action="store_true",
                         help="Raw bus diagnostic: show RX bytes per servo ping")
+    parser.add_argument("--calibrate", type=int, nargs="+", metavar="ID",
+                        help="Calibrate one or more servos by ID  e.g. --calibrate 4 5 6")
     args = parser.parse_args()
-    discover(args.ip, args.port, debug=args.debug)
+
+    if args.calibrate:
+        calibrate(args.ip, args.port, args.calibrate)
+    else:
+        discover(args.ip, args.port, debug=args.debug)
 
 
 if __name__ == "__main__":

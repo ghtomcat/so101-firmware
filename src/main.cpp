@@ -56,6 +56,46 @@ static void reply_fk_reject(AsyncWebSocketClient *client, const char *reason) {
 }
 
 // ---------------------------------------------------------------------------
+// Calibration task — runs cal_sweep off the AsyncTCP callback to avoid
+// blocking the TCP task long enough to trip the watchdog.
+// ---------------------------------------------------------------------------
+
+struct CalArgs {
+    uint8_t  id;
+    uint16_t speed;
+    float    margin;
+    uint16_t load_thresh;
+    uint32_t timeout_ms;
+};
+
+static void cal_task(void *pv) {
+    auto *a = static_cast<CalArgs *>(pv);
+    CalResult r = cal_sweep(a->id, a->speed, a->margin, a->load_thresh, a->timeout_ms);
+    delete a;
+
+    JsonDocument res;
+    if (!r.ok) {
+        res["ok"]  = false;
+        res["err"] = "end-stop not found";
+    } else {
+        cal_save();
+        monitor_record_cmd();
+        res["ok"]        = true;
+        res["id"]        = r.id;
+        res["center"]    = r.center_step;
+        res["min_deg"]   = serialized(String(r.min_deg,   2));
+        res["max_deg"]   = serialized(String(r.max_deg,   2));
+        res["range_deg"] = serialized(String(r.range_deg, 2));
+        res["min_step"]  = r.min_step;
+        res["max_step"]  = r.max_step;
+    }
+    String out;
+    serializeJson(res, out);
+    ws.textAll(out);   // broadcast — the requesting client will receive it
+    vTaskDelete(nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatch
 //
 // Every command that reaches a servo resets the watchdog via monitor_record_cmd().
@@ -463,30 +503,10 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
         uint16_t load_thresh = req["load_thresh"] | 400;
         uint32_t timeout_ms  = req["timeout_ms"]  | 8000;
 
-        // cal_sweep blocks — run it here in the WS callback task.
-        // The sweep takes the bus_mutex internally so the monitor task backs off.
-        CalResult r = cal_sweep(id, speed, margin, load_thresh, timeout_ms);
-
-        if (!r.ok) {
-            reply_error(client, "end-stop not found");
-            return;
-        }
-
-        // Persist to NVS
-        cal_save();
-        monitor_record_cmd();
-
-        JsonDocument res;
-        res["ok"]        = true;
-        res["id"]        = r.id;
-        res["center"]    = r.center_step;
-        res["min_deg"]   = serialized(String(r.min_deg,   2));
-        res["max_deg"]   = serialized(String(r.max_deg,   2));
-        res["range_deg"] = serialized(String(r.range_deg, 2));
-        res["min_step"]  = r.min_step;
-        res["max_step"]  = r.max_step;
-        ws_send(client, res);
-        return;
+        monitor_record_cmd(); // reset watchdog before blocking sweep begins
+        auto *args = new CalArgs{id, speed, margin, load_thresh, timeout_ms};
+        xTaskCreate(cal_task, "cal_sweep", 8192, args, 5, nullptr);
+        return;  // response sent by cal_task when sweep finishes
     }
 
     // -----------------------------------------------------------------------

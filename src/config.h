@@ -9,8 +9,8 @@
 // Connect: RS-485 terminal A → servo data line, terminal B → GND.
 #define PIN_5V_EN       16   // must be HIGH to power the RS-485 chip
 #define SERVO_DIR_PIN   17   // RS485_EN_PIN: HIGH = transmit, LOW = receive
-#define SERVO_TX_PIN    22   // RS485_TX_PIN
-#define SERVO_RX_PIN    21   // RS485_RX_PIN
+#define SERVO_TX_PIN    25   // UART TX remapped to exposed header pin (URT-2 RXD)
+#define SERVO_RX_PIN    32   // Direct TTL RX (SP3485 RO not exposed; servo DATA wired to GPIO 32)
 #define RS485_SE_PIN    19   // slew-rate: HIGH = full speed (required at 1 Mbps)
 
 #define SERVO_BAUD      1000000
@@ -45,7 +45,7 @@
 // --- CAN bus (T-CAN485 onboard TJA1050 transceiver) ---
 // Set CAN_ENABLE to 0 for single-node deployments where CAN is not used.
 // All CAN code compiles away when CAN_ENABLE is 0.
-#define CAN_ENABLE          1
+#define CAN_ENABLE          0
 
 #if CAN_ENABLE
 #define CAN_TX_PIN          26      // from T-CAN485 schematic

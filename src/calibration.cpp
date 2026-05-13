@@ -1,5 +1,6 @@
 #include "calibration.h"
 #include "feetech.h"
+#include "monitor.h"
 #include <Preferences.h>
 #include <math.h>
 #include "freertos/semphr.h"
@@ -99,63 +100,146 @@ CalResult cal_sweep(uint8_t id, uint16_t speed, float margin_deg,
     // -----------------------------------------------------------------------
     Serial.printf("[cal]   id=%u sweeping toward max...\n", id);
 
+    // Enable torque, wait for servo to be ready, then command to max.
     xSemaphoreTake(bus_mutex, portMAX_DELAY);
-    // Command a target far in the positive direction; the servo will stall
-    // at the physical end-stop. We monitor load to detect the stall.
-    feetech_write_pos(id, 4095, speed, 10);
+    bool torque_ok = feetech_write_torque(id, true);
     xSemaphoreGive(bus_mutex);
+    Serial.printf("[cal]   id=%u torque_enable=%s\n", id, torque_ok ? "OK" : "FAIL");
+    if (!torque_ok) {
+        // Retry once — first attempt may lose the response if bus was idle.
+        delay(20);
+        xSemaphoreTake(bus_mutex, portMAX_DELAY);
+        torque_ok = feetech_write_torque(id, true);
+        xSemaphoreGive(bus_mutex);
+        Serial.printf("[cal]   id=%u torque_enable retry=%s\n", id, torque_ok ? "OK" : "FAIL");
+    }
+
+    delay(50); // let servo engage torque before commanding position
+
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    bool pos_ok = feetech_write_pos(id, 4095, speed, 10);
+    xSemaphoreGive(bus_mutex);
+    Serial.printf("[cal]   id=%u pos_cmd 4095 speed=%u: %s\n", id, speed, pos_ok ? "OK" : "FAIL");
+
+    // End-stop detection: servo must first travel MIN_TRAVEL steps away from
+    // its starting position (proving it is actually moving), then be stable
+    // for STABLE_COUNT × 50 ms (proving it has reached a hard stop).
+    const uint16_t MIN_TRAVEL   = 50;  // steps before stability check begins
+    const uint16_t STABLE_TOL   = 4;   // noise floor in steps
+    const int      STABLE_COUNT = 6;   // 300 ms of no movement
+
+    // Read starting position before the sweep begins.
+    ServoState st0{};
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    feetech_read_state(id, st0);
+    xSemaphoreGive(bus_mutex);
+    uint16_t start_pos = st0.position;
+    Serial.printf("[cal]   id=%u start_pos=%u\n", id, start_pos);
 
     uint32_t phase_deadline = millis() + timeout_ms;
     uint16_t max_step = 4095;
+    uint16_t prev_pos = start_pos;
+    int      stable   = 0;
+    bool     moving   = false;
 
     while (millis() < phase_deadline) {
-        delay(20);
+        delay(50);
+        monitor_record_cmd();
         ServoState st{};
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
         bool ok = feetech_read_state(id, st);
         xSemaphoreGive(bus_mutex);
-
         if (!ok) continue;
 
-        if (abs(st.load) >= (int16_t)load_thresh) {
-            max_step = st.position;
-            Serial.printf("[cal]   id=%u max_step=%u (load=%d)\n", id, max_step, st.load);
-            break;
+        if (!moving) {
+            if ((uint16_t)abs((int)st.position - (int)start_pos) >= MIN_TRAVEL) {
+                moving   = true;
+                prev_pos = st.position;
+                stable   = 0;
+            }
+            continue; // don't start counting until the servo has moved
+        }
+
+        if ((uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL) {
+            if (++stable >= STABLE_COUNT) {
+                max_step = st.position;
+                Serial.printf("[cal]   id=%u max_step=%u (stable)\n", id, max_step);
+                break;
+            }
+        } else {
+            stable   = 0;
+            prev_pos = st.position;
         }
     }
 
     if (millis() >= phase_deadline) {
         Serial.printf("[cal]   id=%u timeout finding max end-stop\n", id);
-        return r; // ok stays false
+        return r;
     }
 
-    delay(100); // brief pause before reversing
+    // Release end-stop: disable torque so the joint mechanically relaxes,
+    // then re-enable. This clears the servo's internal overload-protection
+    // flag before the reverse sweep begins.
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    feetech_write_torque(id, false);
+    xSemaphoreGive(bus_mutex);
+    delay(500);
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    feetech_write_torque(id, true);
+    xSemaphoreGive(bus_mutex);
+    delay(100);
 
     // -----------------------------------------------------------------------
     // Phase 2 — sweep toward min_step (negative direction)
     // -----------------------------------------------------------------------
     Serial.printf("[cal]   id=%u sweeping toward min...\n", id);
 
+    // Read the actual position after the relaxation delay — the joint may
+    // have drifted slightly from max_step while torque was off.
+    ServoState st_relax{};
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    feetech_read_state(id, st_relax);
+    xSemaphoreGive(bus_mutex);
+
     xSemaphoreTake(bus_mutex, portMAX_DELAY);
     feetech_write_pos(id, 0, speed, 10);
     xSemaphoreGive(bus_mutex);
 
+    start_pos = st_relax.position;
+    Serial.printf("[cal]   id=%u phase2 start_pos=%u\n", id, start_pos);
     phase_deadline = millis() + timeout_ms;
     uint16_t min_step = 0;
+    prev_pos = start_pos;
+    stable   = 0;
+    moving   = false;
 
     while (millis() < phase_deadline) {
-        delay(20);
+        delay(50);
+        monitor_record_cmd();
         ServoState st{};
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
         bool ok = feetech_read_state(id, st);
         xSemaphoreGive(bus_mutex);
-
         if (!ok) continue;
 
-        if (abs(st.load) >= (int16_t)load_thresh) {
-            min_step = st.position;
-            Serial.printf("[cal]   id=%u min_step=%u (load=%d)\n", id, min_step, st.load);
-            break;
+        if (!moving) {
+            if ((uint16_t)abs((int)st.position - (int)start_pos) >= MIN_TRAVEL) {
+                moving   = true;
+                prev_pos = st.position;
+                stable   = 0;
+            }
+            continue;
+        }
+
+        if ((uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL) {
+            if (++stable >= STABLE_COUNT) {
+                min_step = st.position;
+                Serial.printf("[cal]   id=%u min_step=%u (stable)\n", id, min_step);
+                break;
+            }
+        } else {
+            stable   = 0;
+            prev_pos = st.position;
         }
     }
 
