@@ -8,6 +8,7 @@
 #include "config.h"
 #include "feetech.h"
 #include "joints.h"
+#include "kinematics.h"
 #include "monitor.h"
 #include "calibration.h"
 #include "can_bus.h"
@@ -43,6 +44,14 @@ static void reply_error(AsyncWebSocketClient *client, const char *msg) {
     JsonDocument doc;
     doc["ok"]  = false;
     doc["err"] = msg;
+    ws_send(client, doc);
+}
+
+static void reply_fk_reject(AsyncWebSocketClient *client, const char *reason) {
+    JsonDocument doc;
+    doc["ok"]  = false;
+    doc["err"] = "fk_reject";
+    doc["fk"]  = reason;
     ws_send(client, doc);
 }
 
@@ -119,21 +128,37 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
         uint8_t  id    = req["id"]    | 1;
         uint16_t speed = req["speed"] | 500;
         uint8_t  acc   = req["acc"]   | 50;
+
+        const JointConfig *j = joint_by_id(id);
+        if (!j) { reply_error(client, "unknown joint"); return; }
+
+        // Resolve target: "angle" wins over "pos" over default_deg.
+        float    target_deg = j->default_deg;
         uint16_t step;
 
         if (!req["angle"].isNull()) {
-            float deg = req["angle"].as<float>();
-            if (!angle_to_step(id, deg, &step)) {
+            target_deg = req["angle"].as<float>();
+            if (!angle_to_step(id, target_deg, &step)) {
                 reply_error(client, "unknown joint");
                 return;
             }
         } else if (!req["pos"].isNull()) {
             step = req["pos"].as<uint16_t>();
+            step_to_angle(id, step, &target_deg);
         } else {
-            // No position given — move to default_deg
-            const JointConfig *j = joint_by_id(id);
-            if (!j) { reply_error(client, "unknown joint"); return; }
-            angle_to_step(id, j->default_deg, &step);
+            angle_to_step(id, target_deg, &step);
+        }
+
+        // FK safety check: overlay this joint's new angle on current cached pose.
+        float angles[SERVO_COUNT];
+        monitor_get_angles(angles);
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            if (joints[i].id == id) { angles[i] = target_deg; break; }
+        }
+        char fk_reason[32];
+        if (!fk_check(angles, fk_reason)) {
+            reply_fk_reject(client, fk_reason);
+            return;
         }
 
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
@@ -223,32 +248,52 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
 
         uint8_t  ids[SERVO_COUNT], accs[SERVO_COUNT];
         uint16_t pos[SERVO_COUNT], spd[SERVO_COUNT];
+        float    degs[SERVO_COUNT];
         uint8_t  count = 0;
 
         for (JsonObject s : servos) {
             if (count >= SERVO_COUNT) break;
-            uint8_t id    = s["id"] | 1;
+            uint8_t  id   = s["id"] | 1;
             uint16_t step = 0;
+            float    deg  = 0.0f;
+
+            const JointConfig *j = joint_by_id(id);
+            if (!j) continue;
 
             if (!s["angle"].isNull()) {
-                float deg = s["angle"].as<float>();
-                if (!angle_to_step(id, deg, &step)) continue; // skip unknown joint
+                deg = s["angle"].as<float>();
+                if (!angle_to_step(id, deg, &step)) continue;
             } else if (!s["pos"].isNull()) {
                 step = s["pos"].as<uint16_t>();
+                step_to_angle(id, step, &deg);
             } else {
-                const JointConfig *j = joint_by_id(id);
-                if (!j) continue;
-                angle_to_step(id, j->default_deg, &step);
+                deg = j->default_deg;
+                angle_to_step(id, deg, &step);
             }
 
             ids[count]  = id;
             pos[count]  = step;
             spd[count]  = s["speed"] | default_speed;
             accs[count] = s["acc"]   | default_acc;
+            degs[count] = deg;
             count++;
         }
 
         if (count == 0) { reply_error(client, "no valid servos"); return; }
+
+        // FK safety check: overlay all commanded angles on current cached pose.
+        float angles[SERVO_COUNT];
+        monitor_get_angles(angles);
+        for (uint8_t n = 0; n < count; n++) {
+            for (int i = 0; i < SERVO_COUNT; i++) {
+                if (joints[i].id == ids[n]) { angles[i] = degs[n]; break; }
+            }
+        }
+        char fk_reason[32];
+        if (!fk_check(angles, fk_reason)) {
+            reply_fk_reject(client, fk_reason);
+            return;
+        }
 
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
         feetech_sync_write_pos(ids, pos, spd, accs, count);
@@ -481,8 +526,20 @@ void setup() {
     // --- CAN bus (disabled at compile time when CAN_ENABLE=0) ---
     can_init();
 
-    // Route incoming CAN CMD_MOVE to the same servo path as WebSocket commands.
+    // Route incoming CAN CMD_MOVE through the same FK check and servo path.
     can_set_move_callback([](uint8_t sid, uint16_t step, uint16_t spd, uint8_t acc) {
+        float deg = 0.0f;
+        step_to_angle(sid, step, &deg);
+        float angles[SERVO_COUNT];
+        monitor_get_angles(angles);
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            if (joints[i].id == sid) { angles[i] = deg; break; }
+        }
+        char reason[32];
+        if (!fk_check(angles, reason)) {
+            Serial.printf("[fk]   CAN move rejected id=%u: %s\n", sid, reason);
+            return;
+        }
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
         feetech_write_pos(sid, step, spd, acc);
         xSemaphoreGive(bus_mutex);

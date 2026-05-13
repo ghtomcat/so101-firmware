@@ -34,6 +34,14 @@
 #define SD_CS_PIN       13
 #define SD_LOG_FILE     "/so101.log"   // log file path on SD card
 
+// --- Forward-kinematics safety envelope ---
+// Checked before every move command executes (WebSocket and CAN paths).
+// Geometry is derived from the SO-101 URDF (so101_new_calib.urdf).
+// Increase FK_MIN_HEIGHT_M if the arm is mounted above a surface it must not hit.
+// Decrease FK_MAX_REACH_M to restrict the operational workspace further.
+#define FK_MIN_HEIGHT_M     0.0f    // minimum z of any link node (meters above base plane)
+#define FK_MAX_REACH_M      0.45f   // maximum TCP distance from base origin (meters)
+
 // --- CAN bus (T-CAN485 onboard TJA1050 transceiver) ---
 // Set CAN_ENABLE to 0 for single-node deployments where CAN is not used.
 // All CAN code compiles away when CAN_ENABLE is 0.

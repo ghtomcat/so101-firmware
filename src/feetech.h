@@ -16,6 +16,7 @@
 #define ID_BROADCAST    0xFE
 
 // RAM register map (STS3215)
+#define REG_TORQUE_EN       40   // 1 byte  (1 = torque on, 0 = off)
 #define REG_GOAL_ACC        41   // 1 byte
 #define REG_GOAL_POS        43   // 2 bytes (L then H)
 #define REG_GOAL_TIME       45   // 2 bytes (0 = use speed mode)

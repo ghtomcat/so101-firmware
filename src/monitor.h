@@ -34,6 +34,13 @@
 //   { "type":"alert", "id":1, "reason":"volt",  "value":58 }
 // ---------------------------------------------------------------------------
 
+// Returns the most recent joint angles (degrees) read by the telemetry task,
+// indexed to match joints[] order (same indexing as fk_compute's angles_deg[]).
+// Initialised to default_deg values at boot; updated every TELEMETRY_MS.
+// Not mutex-protected — a stale read by at most one telemetry cycle is acceptable
+// for FK safety checks since joint limits already bound individual axes.
+void monitor_get_angles(float out[SERVO_COUNT]);
+
 // Initialise the monitor. Call once from setup() after feetech_init().
 //   ws_handle   — pointer to the AsyncWebSocket instance for broadcasting.
 //   bus_mutex   — FreeRTOS mutex that guards all feetech_* calls.

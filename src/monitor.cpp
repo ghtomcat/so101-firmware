@@ -14,9 +14,10 @@
 static AsyncWebSocket    *_ws       = nullptr;
 static SemaphoreHandle_t  _bus_mtx  = nullptr;
 static volatile uint32_t  _last_cmd_ms = 0;
-static bool               _torque_cut = false; // true once watchdog has fired
+static bool               _torque_cut = false;
 static bool               _sd_ok      = false;
 static File               _log_file;
+static float              _last_angles[SERVO_COUNT]; // latest read angles, indexed by joints[]
 
 // ---------------------------------------------------------------------------
 // SD / blackbox helpers
@@ -148,6 +149,7 @@ static void monitor_task(void *) {
 
             float angle = 0.0f;
             step_to_angle(id, st.position, &angle);
+            _last_angles[i] = angle;   // update cache for FK checks
 
             o["pos"]   = st.position;
             o["angle"] = serialized(String(angle, 2));
@@ -193,6 +195,9 @@ void monitor_start(AsyncWebSocket *ws_handle, SemaphoreHandle_t bus_mutex) {
     _bus_mtx = bus_mutex;
     _last_cmd_ms = millis();
 
+    // Seed angle cache with firmware defaults so FK checks work before first telemetry cycle.
+    for (int i = 0; i < SERVO_COUNT; i++) _last_angles[i] = joints[i].default_deg;
+
     sd_init();
 
     sd_log("INFO", "SO-101 monitor started");
@@ -214,4 +219,8 @@ void monitor_record_cmd() {
 
 bool monitor_sd_ok() {
     return _sd_ok;
+}
+
+void monitor_get_angles(float out[SERVO_COUNT]) {
+    for (int i = 0; i < SERVO_COUNT; i++) out[i] = _last_angles[i];
 }

@@ -546,6 +546,70 @@ network until the fault is cleared.
 
 ---
 
+## Forward kinematics safety check
+
+Every motion command (`move`, `sync_move`, and CAN `CMD_MOVE`) passes through a
+forward-kinematics (FK) check before any servo is driven.
+
+### How it works
+
+1. **FK computation** — joint angles are chained through 4×4 homogeneous transforms
+   derived from the SO-101 URDF (`so101_new_calib.urdf`).  Seven nodes are produced:
+   base origin + six joint-frame origins + the tool-centre-point (TCP).
+2. **Ground clearance** — every node must satisfy `z ≥ FK_MIN_HEIGHT_M` (default `0.0 m`).
+   This prevents any part of the arm from going below the mounting plane.
+3. **Reach limit** — TCP distance from base origin must be ≤ `FK_MAX_REACH_M` (default `0.45 m`).
+4. **Self-collision** — each link is modelled as a capsule.  All 15 non-adjacent link pairs
+   are tested; if the inter-capsule gap falls below the sum of their radii the move is rejected.
+
+### Capsule radii
+
+| Link | Segment | Radius |
+|------|---------|--------|
+| 0 | base → shoulder_pan | 60 mm |
+| 1 | shoulder_pan → shoulder_lift | 42 mm |
+| 2 | shoulder_lift → elbow_flex | 40 mm |
+| 3 | elbow_flex → wrist_flex | 38 mm |
+| 4 | wrist_flex → wrist_roll | 32 mm |
+| 5 | wrist_roll → gripper | 28 mm |
+| 6 | gripper → TCP | 25 mm |
+
+Radii are conservative (enclose full servo housing) so false negatives are extremely unlikely.
+
+### Rejection response
+
+```json
+{ "ok": false, "err": "fk_reject", "fk": "collision:1-3" }
+{ "ok": false, "err": "fk_reject", "fk": "below_floor:4" }
+{ "ok": false, "err": "fk_reject", "fk": "over_reach" }
+```
+
+The `"fk"` field encodes the rejection reason:
+
+| Value | Meaning |
+|-------|---------|
+| `below_floor:N` | Node N would go below `FK_MIN_HEIGHT_M` |
+| `over_reach` | TCP distance would exceed `FK_MAX_REACH_M` |
+| `collision:A-B` | Links A and B would interpenetrate |
+
+### Angle convention note
+
+FK uses the angles as reported by the firmware (degrees, sign and zero as set by
+calibration).  At the time of each check, the cached angles from the most recent
+telemetry cycle are used for any joint not included in the command.  The cache is
+initialised to each joint's `default_deg` at boot.
+
+### Tuning
+
+| `config.h` constant | Default | Effect |
+|---------------------|---------|--------|
+| `FK_MIN_HEIGHT_M` | `0.0` | Minimum z for all nodes (meters). Increase if arm is mounted above an obstacle. |
+| `FK_MAX_REACH_M`  | `0.45` | Maximum TCP reach (meters). Decrease to restrict workspace. |
+
+Capsule radii and collision pairs are in `src/kinematics.cpp`.
+
+---
+
 ## Wiring (T-CAN485 → SO-101)
 
 ```
