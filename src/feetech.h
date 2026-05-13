@@ -40,6 +40,11 @@ void feetech_init(HardwareSerial &serial, int rx, int tx, int dir, long baud);
 
 bool feetech_ping(uint8_t id);
 
+// Debug ping: sends a PING and captures all raw RX bytes within a 30 ms window.
+// Logs sent/received bytes to Serial. buf must be >= 16 bytes.
+// Returns number of bytes received (0 = nothing came back).
+int feetech_debug_ping(uint8_t id, uint8_t *buf, int buf_len);
+
 // Move servo id to position [0-4095], speed [0-3400 steps/s], acc [0-254]
 // Time is set to 0 (speed-controlled mode). Returns true on success.
 bool feetech_write_pos(uint8_t id, uint16_t pos, uint16_t speed, uint8_t acc);

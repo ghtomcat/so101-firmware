@@ -100,6 +100,31 @@ void feetech_init(HardwareSerial &serial, int rx, int tx, int dir, long baud) {
     delay(100);
 }
 
+int feetech_debug_ping(uint8_t id, uint8_t *buf, int buf_len) {
+    _serial->flush();
+    while (_serial->available()) _serial->read();
+
+    uint8_t chk = (uint8_t)~(uint8_t)(id + 2 + INST_PING);
+    Serial.printf("[bus] TX  ping id=%u  FF FF %02X 02 01 %02X\n", id, id, chk);
+
+    send_packet(id, INST_PING, nullptr, 0);
+
+    uint32_t deadline = millis() + 30;
+    int n = 0;
+    while (millis() < deadline && n < buf_len) {
+        if (_serial->available()) buf[n++] = _serial->read();
+    }
+
+    if (n == 0) {
+        Serial.printf("[bus] RX  ping id=%u  TIMEOUT — 0 bytes\n", id);
+    } else {
+        Serial.printf("[bus] RX  ping id=%u  %d byte(s):", id, n);
+        for (int i = 0; i < n; i++) Serial.printf(" %02X", buf[i]);
+        Serial.println();
+    }
+    return n;
+}
+
 bool feetech_ping(uint8_t id) {
     _serial->flush();
     while (_serial->available()) _serial->read(); // drain

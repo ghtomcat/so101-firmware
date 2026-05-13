@@ -116,6 +116,50 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
     }
 
     // -----------------------------------------------------------------------
+    // debug_scan — raw bus diagnostic: captures RX bytes for each servo ping
+    // Request:  { "cmd":"debug_scan" }
+    // Response: { "ok":true, "servos":[
+    //   {"id":1, "rx":0, "hex":"",         "valid":false},  <- nothing back
+    //   {"id":2, "rx":6, "hex":"FF FF ...", "valid":true }   <- good response
+    // ]}
+    // rx=0  → no signal at all (check wiring / DIR pin / power)
+    // rx>0  → servo is responding; "valid":true means checksum passed
+    // Also prints raw bytes to the serial monitor for each ID.
+    // -----------------------------------------------------------------------
+    if (strcmp(cmd, "debug_scan") == 0) {
+        JsonDocument res;
+        res["ok"] = true;
+        JsonArray servos = res["servos"].to<JsonArray>();
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            uint8_t id = joints[i].id;
+            uint8_t rx[32];
+            xSemaphoreTake(bus_mutex, portMAX_DELAY);
+            int n = feetech_debug_ping(id, rx, sizeof(rx));
+            xSemaphoreGive(bus_mutex);
+
+            // Build hex string "FF FF 01 02 00 F9"
+            char hex[3 * 32 + 1] = {};
+            for (int j = 0; j < n; j++)
+                snprintf(hex + j * 3, 4, "%02X ", rx[j]);
+            if (n > 0) hex[n * 3 - 1] = '\0';
+
+            // Valid ping response: FF FF id 02 00 chk
+            uint8_t expected_chk = (uint8_t)~(uint8_t)(id + 2);
+            bool valid = (n >= 6 && rx[0] == 0xFF && rx[1] == 0xFF &&
+                          rx[2] == id && rx[3] == 0x02 && rx[4] == 0x00 &&
+                          rx[5] == expected_chk);
+
+            JsonObject sv = servos.add<JsonObject>();
+            sv["id"]    = id;
+            sv["rx"]    = n;
+            sv["hex"]   = hex;
+            sv["valid"] = valid;
+        }
+        ws_send(client, res);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
     // move — move a single joint
     // Request:  { "cmd":"move", "id":1, "angle":45.0, "speed":500, "acc":50 }
     //        or { "cmd":"move", "id":1, "pos":2560,   "speed":500, "acc":50 }

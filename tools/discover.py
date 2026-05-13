@@ -87,7 +87,7 @@ def ws_recv(sock: socket.socket) -> str:
 
 # ── Discovery ────────────────────────────────────────────────────────────────
 
-def discover(ip: str, port: int = 80) -> None:
+def discover(ip: str, port: int = 80, debug: bool = False) -> None:
     url = f"ws://{ip}:{port}/ws"
     print(f"Connecting to {url} ...")
 
@@ -100,6 +100,10 @@ def discover(ip: str, port: int = 80) -> None:
         welcome = json.loads(ws_recv(sock))
         sd = "SD logging ON" if welcome.get("sd_log") else "SD logging OFF"
         print(f"Connected  joints={welcome.get('joints', '?')}  {sd}\n")
+
+        if debug:
+            _debug_scan(sock)
+            return
 
         ws_send(sock, json.dumps({"cmd": "scan"}))
         resp = json.loads(ws_recv(sock))
@@ -138,6 +142,42 @@ def discover(ip: str, port: int = 80) -> None:
         sock.close()
 
 
+def _debug_scan(sock) -> None:
+    print("Running bus diagnostic (debug_scan) …\n")
+    ws_send(sock, json.dumps({"cmd": "debug_scan"}))
+    resp = json.loads(ws_recv(sock))
+
+    if not resp.get("ok"):
+        print(f"debug_scan failed: {resp}")
+        return
+
+    print(f"{'ID':<4}  {'RX bytes':>8}  {'Valid':>6}  Raw hex")
+    print("─" * 60)
+    for sv in resp.get("servos", []):
+        sid    = sv["id"]
+        n      = sv["rx"]
+        valid  = sv["valid"]
+        hexstr = sv.get("hex", "")
+        status = "OK" if valid else ("TIMEOUT" if n == 0 else "BAD CHK")
+        print(f"{sid:<4}  {n:>8}  {status:>6}  {hexstr}")
+
+    print()
+    any_rx  = any(sv["rx"] > 0 for sv in resp.get("servos", []))
+    any_ok  = any(sv["valid"]  for sv in resp.get("servos", []))
+
+    if any_ok:
+        print("Servo(s) responding correctly — run without --debug to see full state.")
+    elif any_rx:
+        print("Bytes received but checksum failed.")
+        print("  → Check baud rate (should be 1 000 000), or possible noise on the bus.")
+    else:
+        print("Nothing received from any servo.")
+        print("  → Check: RS-485 terminal B connected to GND?")
+        print("  → Check: servo power ≥ 6 V?")
+        print("  → Check: DIR pin (GPIO 17) not shorted?")
+        print("  → Check: A/B terminals not swapped?")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Discover SO-101 servos via ESP32 WebSocket",
@@ -146,8 +186,10 @@ def main() -> None:
     parser.add_argument("ip", help="ESP32 IP address  e.g. 192.168.1.100")
     parser.add_argument("--port", type=int, default=80, metavar="PORT",
                         help="WebSocket port (default: 80)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Raw bus diagnostic: show RX bytes per servo ping")
     args = parser.parse_args()
-    discover(args.ip, args.port)
+    discover(args.ip, args.port, debug=args.debug)
 
 
 if __name__ == "__main__":
