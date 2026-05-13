@@ -1,112 +1,150 @@
-# SO-101 ESP32 Firmware
+# so101-firmware
 
-WiFi bridge firmware for the [Seeed Studio SO-101](https://www.seeedstudio.com/SO-ARM101-Low-Cost-AI-Arm-Kit-Pro-p-6427.html) robot arm, running on the [LILYGO T-CAN485](https://github.com/Xinyuan-LilyGO/T-CAN485) ESP32 board.
+ESP32 firmware for the [Seeed Studio SO-101](https://www.seeedstudio.com/SO-ARM101-Low-Cost-AI-Arm-Kit-Pro-p-6427.html) robot arm, running on the [LILYGO T-CAN485](https://github.com/Xinyuan-LilyGO/T-CAN485) board (Feetech STS3215 servos).
 
-Both a browser JS page and Python/LeRobot can control the arm over WebSocket simultaneously. The ESP32 enforces joint limits, monitors servo health, and logs everything to SD — independent of whatever controller is connected.
+The defining design principle: **the ESP32 is the permanent safety boundary**. Every motion command — from a browser, a Python script, a LeRobot policy, or a CAN peer — passes through the same joint-limit, FK self-collision, watchdog, and blackbox layer before any servo moves. There is no bypass.
 
-## Features
+---
 
-- **WebSocket API** — JSON commands for move, sync move, read, scan, stop, torque control
-- **Angle-based control** — send degrees, not raw steps; calibration stored in NVS flash
-- **Automated calibration** — end-stop sweep finds physical limits and computes joint center automatically
-- **Safety layer** — joint limits clamped at firmware level, temperature/load/voltage thresholds, command watchdog cuts torque if controller goes silent
-- **SD blackbox** — every telemetry frame and alert appended to `/so101.log` if a card is present
-- **CAN bus** — multi-node support with Airbus-style N-of-M voting before executing moves; compile away with `CAN_ENABLE 0` for single-node builds
-- **LeRobot compatible** — raw step escape hatch (`"pos"`) lets LeRobot talk directly; safety and logging apply to all controllers equally
+## Safety architecture
+
+```
+Physical end-stops
+  └── Joint-limit clamping          angle_to_step() clips to [min°, max°]
+        └── FK self-collision check   rejects poses before they reach the bus
+              └── Torque watchdog      cuts power if no command for 2 s
+                    └── Thermal / load monitor   per-servo alerts at threshold
+                          └── SD blackbox    every command and rejection timestamped
+```
+
+The FK check computes full forward kinematics from URDF-derived constants entirely on the ESP32 — no offload to a host PC. Each proposed pose is tested against:
+
+- **Floor plane** — no link node below Z = 0
+- **Workspace sphere** — TCP within configurable reach radius
+- **15 capsule pairs** — all non-adjacent link pairs checked for interpenetration
+
+A rejected move returns a structured error; the servo bus is never written:
+
+```json
+{ "ok": false, "err": "fk_reject", "fk": "collision:2-5" }
+{ "ok": false, "err": "fk_reject", "fk": "below_floor:3" }
+{ "ok": false, "err": "fk_reject", "fk": "over_reach"    }
+```
+
+### CAN voting (Airbus EFCS pattern)
+
+When multiple T-CAN485 nodes are connected, a proposed move is broadcast as a `VOTE_REQ` before execution. Each peer independently validates the move against its own safety state and replies with a `VOTE_ACK`. The move only executes if approvals ≥ `CAN_VOTE_QUORUM` within the timeout window — any node in an alert state vetoes the network until the fault clears.
+
+This pattern is borrowed from Airbus fly-by-wire architecture (EFCS), where independent flight control computers must agree before an input is acted on.
+
+---
 
 ## Hardware
 
-| Board | [LILYGO T-CAN485](https://github.com/Xinyuan-LilyGO/T-CAN485) |
-|-------|--------------------------------------------------------------|
-| Arm   | Seeed Studio SO-101 (Feetech STS3215 servos)                 |
-| Bus   | RS-485 terminal A → servo S pin, terminal B → GND           |
-| Power | External 7.4 V supply → servo V1 pins (not the T-CAN485)    |
+| Component | Part |
+|-----------|------|
+| MCU board | [LILYGO T-CAN485](https://github.com/Xinyuan-LilyGO/T-CAN485) (ESP32) |
+| Arm | Seeed Studio SO-101 |
+| Servos | Feetech STS3215 × 6 |
+| Bus | RS-485 — terminal A → servo S pin, terminal B → GND |
+| Power | External 7.4 V → servo V1 pins (not from the T-CAN485) |
 
-The T-CAN485's onboard SP3485 RS-485 transceiver handles half-duplex switching automatically — no additional components needed.
+The T-CAN485's onboard SP3485 transceiver handles half-duplex switching automatically.
+
+---
 
 ## Quickstart
 
-**1. Configure**
+**1. Configure** `src/config.h`:
 
-Edit `src/config.h`:
 ```c
-#define WIFI_SSID  "your-network"
-#define WIFI_PASS  "your-password"
-#define CAN_ENABLE  0   // set to 1 for multi-node CAN setup
+#define WIFI_SSID   "your-network"
+#define WIFI_PASS   "your-password"
+#define CAN_ENABLE  0   // 1 for multi-node CAN setup
 ```
 
-**2. Build and flash**
+**2. Build and flash:**
+
 ```bash
 pio run -t upload
-pio device monitor
+pio device monitor   # prints the IP address once WiFi connects
 ```
 
-The serial monitor prints the IP address once WiFi connects.
+**3. Send commands over WebSocket** (`ws://<device-ip>/ws`):
 
-**3. Test from a browser console**
 ```js
 const ws = new WebSocket("ws://<device-ip>/ws");
-ws.onmessage = e => console.log(JSON.parse(e.data));
 
-// Discover connected servos
-ws.send(JSON.stringify({ cmd: "scan" }));
-
-// Calibrate joint 1 (finds physical end-stops automatically)
-ws.send(JSON.stringify({ cmd: "calibrate", id: 1 }));
-
-// Move joint 1 to 45°
-ws.send(JSON.stringify({ cmd: "move", id: 1, angle: 45.0 }));
-
-// Emergency stop
-ws.send(JSON.stringify({ cmd: "stop" }));
+ws.send(JSON.stringify({ cmd: "scan" }));                          // discover servos
+ws.send(JSON.stringify({ cmd: "calibrate", id: 1 }));             // auto end-stop sweep
+ws.send(JSON.stringify({ cmd: "move", id: 1, angle: 45.0 }));     // move to 45°
+ws.send(JSON.stringify({ cmd: "sync_move", speed: 500, acc: 50,
+  servos: [{ id: 1, angle: 0 }, { id: 2, angle: 45 }] }));        // move multiple joints
+ws.send(JSON.stringify({ cmd: "stop" }));                          // emergency stop
 ```
 
-## Architecture
+---
 
-```
-Browser (HTML/CSS/JS)  ──┐
-                         ├── WebSocket ── ESP32 (T-CAN485) ── Feetech servo bus
-Python / LeRobot       ──┘               │
-                                         ├── CAN bus (optional, multi-node)
-                                         ├── SD card (blackbox log)
-                                         └── NVS flash (calibration)
-```
+## Features
 
-The ESP32 is the safety boundary. Joint limits, torque cutoffs, watchdog, and the blackbox apply to every controller equally — including LeRobot policies. A policy that outputs an out-of-range angle is clamped silently; a controller that crashes causes torque to cut within 2 seconds.
+- **Angle-based control** — send degrees, not raw steps; calibration stored in NVS flash
+- **Automated calibration** — end-stop sweep finds physical limits and computes joint center automatically
+- **FK self-collision checking** — full forward kinematics on the ESP32 using URDF geometry
+- **Joint limits** — clamped in firmware regardless of command source
+- **Watchdog** — torque cut if no command arrives within 2 s
+- **Thermal / load / voltage monitoring** — per-servo alerts with configurable thresholds
+- **SD blackbox** — every telemetry frame, alert, and FK rejection logged to `/so101.log`
+- **CAN bus voting** — Airbus-style N-of-M quorum for multi-node coordination
+- **LeRobot compatible** — raw step escape hatch (`"pos"`) lets LeRobot talk directly; safety applies to all controllers equally
+- **OpenSim HIL** — hardware-in-the-loop bridge to a browser-based 3-D simulator at 50 Hz
 
-The CAN layer borrows the Airbus EFCS architecture: multiple nodes must reach N-of-M quorum before a move executes. Any node in an alert state vetoes the network until the fault clears.
+---
 
 ## Project structure
 
 ```
 src/
-  config.h          — WiFi, pins, safety thresholds, CAN settings
+  config.h          — WiFi, pins, safety thresholds, FK limits, CAN settings
   feetech.h/.cpp    — Feetech STS3215 half-duplex UART driver
-  joints.h/.cpp     — Joint config, angle ↔ step conversion, SO-101 defaults
-  calibration.h/.cpp— End-stop sweep + NVS persistence (Preferences)
+  joints.h/.cpp     — joint config, angle ↔ step conversion, SO-101 defaults
+  calibration.h/.cpp— end-stop sweep + NVS persistence (Preferences)
+  kinematics.h/.cpp — FK computation and self-collision check (URDF geometry)
   monitor.h/.cpp    — FreeRTOS telemetry task, watchdog, SD blackbox
-  can_bus.h/.cpp    — TWAI driver, voting, CAN ↔ WebSocket bridge
-  main.cpp          — WiFi, WebSocket server, command dispatch
+  can_bus.h/.cpp    — TWAI driver, Airbus-style voting, CAN ↔ WebSocket bridge
+  main.cpp          — WiFi, WebSocket server, command dispatch, FK gate
 docs/
-  api.md            — Full API reference (WebSocket commands + CAN frames)
+  api.md            — full WebSocket API, CAN frames, calibration, wiring
+  opensim-hil.md    — hardware-in-the-loop bridge setup and state mapping
 ```
 
-## API
+---
 
-See [`docs/api.md`](docs/api.md) for the complete WebSocket command reference, CAN message formats, voting flow, calibration procedure, and wiring table.
+## OpenSim HIL
 
-## Calibration
+The firmware integrates with [OpenSim](https://github.com/ghtomcat/opensim), a browser-based simulation engine. A Node.js bridge relays joint angles between the simulator and the ESP32 at 50 Hz. Because every `sync_move` still passes through the ESP32's FK and safety layer, a bad trajectory planned in the browser is rejected by the firmware — not by JavaScript. The 3-D renderer shows actual servo positions from telemetry, not commanded positions, so FK rejections are immediately visible as the sim and arm diverge.
 
-Run once after assembly. The firmware sweeps each joint slowly to its physical end-stops, measures the load spike, and computes the center and safe range automatically:
-
-```js
-// Calibrate all joints one by one
-for (let id = 1; id <= 6; id++) {
-  ws.send(JSON.stringify({ cmd: "calibrate", id, speed: 150, margin_deg: 5 }));
-}
+```
+Browser (Three.js)  ──STATE_PATCH──▶  hub.js  ──▶  robot_bridge.js (50 Hz)
+                                                          │
+                                                    ESP32 :80/ws
+                                                          │
+                                                  Feetech servo bus
+                                                          │
+                                         Telemetry ◀──────┘  back to sim
 ```
 
-Results are stored in ESP32 NVS flash and loaded on every boot. No reflashing needed.
+See [`docs/opensim-hil.md`](docs/opensim-hil.md) for setup instructions.
+
+---
+
+## Docs
+
+| Document | Contents |
+|----------|----------|
+| [`docs/api.md`](docs/api.md) | Full WebSocket command reference, CAN message formats, voting flow, calibration, wiring |
+| [`docs/opensim-hil.md`](docs/opensim-hil.md) | HIL bridge setup, state mapping, timing, safety guarantees |
+
+---
 
 ## License
 
