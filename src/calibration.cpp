@@ -95,6 +95,19 @@ CalResult cal_sweep(uint8_t id, uint16_t speed, float margin_deg,
         return r;
     }
 
+    // Lock every other joint at its current position so gravity doesn't pull
+    // the arm out of shape while this joint sweeps.
+    for (int i = 0; i < SERVO_COUNT; i++) {
+        if (joints[i].id == id) continue;
+        ServoState st_hold{};
+        xSemaphoreTake(bus_mutex, portMAX_DELAY);
+        if (feetech_read_state(joints[i].id, st_hold)) {
+            feetech_write_torque(joints[i].id, true);
+            feetech_write_pos(joints[i].id, st_hold.position, 200, 10);
+        }
+        xSemaphoreGive(bus_mutex);
+    }
+
     // -----------------------------------------------------------------------
     // Phase 1 — sweep toward max_step (positive direction)
     // -----------------------------------------------------------------------
@@ -160,15 +173,17 @@ CalResult cal_sweep(uint8_t id, uint16_t speed, float margin_deg,
             continue; // don't start counting until the servo has moved
         }
 
-        if ((uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL) {
+        bool pos_stable  = (uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL;
+        bool load_high   = (st.load & 0x7FFF) >= load_thresh;
+        if (pos_stable && load_high) {
             if (++stable >= STABLE_COUNT) {
                 max_step = st.position;
-                Serial.printf("[cal]   id=%u max_step=%u (stable)\n", id, max_step);
+                Serial.printf("[cal]   id=%u max_step=%u (stable+load)\n", id, max_step);
                 break;
             }
         } else {
-            stable   = 0;
-            prev_pos = st.position;
+            if (!pos_stable) prev_pos = st.position;
+            stable = 0; // gravity pause (low load) or still moving — reset
         }
     }
 
@@ -231,15 +246,17 @@ CalResult cal_sweep(uint8_t id, uint16_t speed, float margin_deg,
             continue;
         }
 
-        if ((uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL) {
+        bool pos_stable  = (uint16_t)abs((int)st.position - (int)prev_pos) <= STABLE_TOL;
+        bool load_high   = (st.load & 0x7FFF) >= load_thresh;
+        if (pos_stable && load_high) {
             if (++stable >= STABLE_COUNT) {
                 min_step = st.position;
-                Serial.printf("[cal]   id=%u min_step=%u (stable)\n", id, min_step);
+                Serial.printf("[cal]   id=%u min_step=%u (stable+load)\n", id, min_step);
                 break;
             }
         } else {
-            stable   = 0;
-            prev_pos = st.position;
+            if (!pos_stable) prev_pos = st.position;
+            stable = 0;
         }
     }
 

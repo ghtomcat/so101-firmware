@@ -66,3 +66,8 @@ bool feetech_write_torque(uint8_t id, bool enable);
 // Enable or disable torque on a set of servos via a single SYNC_WRITE.
 // Pass enable=false for an immediate, bus-level emergency stop.
 bool feetech_torque_all(const uint8_t *ids, uint8_t count, bool enable);
+
+// Write a new ID to a servo's EEPROM. Only the servo with old_id may be on the
+// bus, or all IDs must be unique. The new ID takes effect immediately; NVS
+// calibration data is keyed by ID so recalibration will be needed.
+bool feetech_switch_id(uint8_t old_id, uint8_t new_id);

@@ -233,16 +233,19 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
             angle_to_step(id, target_deg, &step);
         }
 
-        // FK safety check: overlay this joint's new angle on current cached pose.
-        float angles[SERVO_COUNT];
-        monitor_get_angles(angles);
-        for (int i = 0; i < SERVO_COUNT; i++) {
-            if (joints[i].id == id) { angles[i] = target_deg; break; }
-        }
-        char fk_reason[32];
-        if (!fk_check(angles, fk_reason)) {
-            reply_fk_reject(client, fk_reason);
-            return;
+        // FK safety check (skipped when "no_fk":true — e.g. manual jog).
+        bool no_fk = req["no_fk"] | false;
+        if (!no_fk) {
+            float angles[SERVO_COUNT];
+            monitor_get_angles(angles);
+            for (int i = 0; i < SERVO_COUNT; i++) {
+                if (joints[i].id == id) { angles[i] = target_deg; break; }
+            }
+            char fk_reason[32];
+            if (!fk_check(angles, fk_reason)) {
+                reply_fk_reject(client, fk_reason);
+                return;
+            }
         }
 
         xSemaphoreTake(bus_mutex, portMAX_DELAY);
@@ -517,6 +520,142 @@ static void handle_command(AsyncWebSocketClient *client, const String &raw) {
     if (strcmp(cmd, "cal_erase") == 0) {
         cal_erase();
         reply_ok(client);
+        return;
+    }
+
+    // Request:  { "cmd":"cart_move", "x":0.25, "y":0.0, "z":0.15,
+    //             "speed":300, "acc":30, "tol":0.002 }
+    // Moves the TCP to the requested absolute world position via IK.
+    // Response: { "ok":true, "tcp":{"x":…,"y":…,"z":…} }
+    //        or { "ok":false, "err":"no_converge"|"fk_reject", "fk":"reason" }
+    // -----------------------------------------------------------------------
+    if (strcmp(cmd, "cart_move") == 0) {
+        Vec3 target = { req["x"] | 0.0f, req["y"] | 0.0f, req["z"] | 0.0f };
+        uint16_t speed = req["speed"] | 300;
+        uint8_t  acc   = req["acc"]   | 30;
+        float    tol   = req["tol"]   | 0.002f;
+
+        float cur[SERVO_COUNT], res[SERVO_COUNT];
+        monitor_get_angles(cur);
+
+        bool converged = ik_solve(cur, target, res, 40, tol);
+
+        char fk_reason[32] = "";
+        if (!fk_check(res, fk_reason)) {
+            JsonDocument doc;
+            doc["ok"]  = false;
+            doc["err"] = "fk_reject";
+            doc["fk"]  = fk_reason;
+            String out; serializeJson(doc, out); client->text(out);
+            return;
+        }
+
+        uint8_t  ids[SERVO_COUNT];
+        uint16_t pos[SERVO_COUNT];
+        uint16_t spd[SERVO_COUNT];
+        uint8_t  acs[SERVO_COUNT];
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            ids[i] = joints[i].id;
+            angle_to_step(joints[i].id, res[i], &pos[i]);
+            spd[i] = speed;
+            acs[i] = acc;
+        }
+
+        xSemaphoreTake(bus_mutex, portMAX_DELAY);
+        feetech_sync_write_pos(ids, pos, spd, acs, SERVO_COUNT);
+        xSemaphoreGive(bus_mutex);
+        monitor_record_cmd();
+
+        Vec3 tcp = fk_tcp(res);
+        JsonDocument doc;
+        doc["ok"]      = converged;
+        doc["tcp"]["x"] = tcp.x;
+        doc["tcp"]["y"] = tcp.y;
+        doc["tcp"]["z"] = tcp.z;
+        if (!converged) doc["err"] = "no_converge";
+        String out; serializeJson(doc, out); client->text(out);
+        return;
+    }
+
+    // Request:  { "cmd":"cart_jog", "dx":0.01, "dy":0, "dz":0,
+    //             "speed":300, "acc":30, "tol":0.002 }
+    // Moves the TCP by a Cartesian delta relative to its current position.
+    // Response: same shape as cart_move.
+    // -----------------------------------------------------------------------
+    if (strcmp(cmd, "cart_jog") == 0) {
+        float dx = req["dx"] | 0.0f;
+        float dy = req["dy"] | 0.0f;
+        float dz = req["dz"] | 0.0f;
+        uint16_t speed = req["speed"] | 300;
+        uint8_t  acc   = req["acc"]   | 30;
+        float    tol   = req["tol"]   | 0.002f;
+
+        float cur[SERVO_COUNT];
+        monitor_get_angles(cur);
+        Vec3 cur_tcp = fk_tcp(cur);
+        Vec3 target  = { cur_tcp.x + dx, cur_tcp.y + dy, cur_tcp.z + dz };
+
+        float res[SERVO_COUNT];
+        bool converged = ik_solve(cur, target, res, 40, tol);
+
+        char fk_reason[32] = "";
+        if (!fk_check(res, fk_reason)) {
+            JsonDocument doc;
+            doc["ok"]  = false;
+            doc["err"] = "fk_reject";
+            doc["fk"]  = fk_reason;
+            String out; serializeJson(doc, out); client->text(out);
+            return;
+        }
+
+        uint8_t  ids[SERVO_COUNT];
+        uint16_t pos[SERVO_COUNT];
+        uint16_t spd[SERVO_COUNT];
+        uint8_t  acs[SERVO_COUNT];
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            ids[i] = joints[i].id;
+            angle_to_step(joints[i].id, res[i], &pos[i]);
+            spd[i] = speed;
+            acs[i] = acc;
+        }
+
+        xSemaphoreTake(bus_mutex, portMAX_DELAY);
+        feetech_sync_write_pos(ids, pos, spd, acs, SERVO_COUNT);
+        xSemaphoreGive(bus_mutex);
+        monitor_record_cmd();
+
+        Vec3 tcp = fk_tcp(res);
+        JsonDocument doc;
+        doc["ok"]       = converged;
+        doc["tcp"]["x"] = tcp.x;
+        doc["tcp"]["y"] = tcp.y;
+        doc["tcp"]["z"] = tcp.z;
+        if (!converged) doc["err"] = "no_converge";
+        String out; serializeJson(doc, out); client->text(out);
+        return;
+    }
+
+    // Request:  { "cmd":"switch_id", "old_id":4, "new_id":6 }
+    // Response: { "ok":true }
+    // Writes a new servo ID to the servo's EEPROM. NVS calibration for old_id
+    // will no longer match; recalibrate after re-IDing all servos.
+    // -----------------------------------------------------------------------
+    if (strcmp(cmd, "switch_id") == 0) {
+        uint8_t old_id = req["old_id"] | 0;
+        uint8_t new_id = req["new_id"] | 0;
+        if (old_id < 1 || old_id > 253 || new_id < 1 || new_id > 253 || old_id == new_id) {
+            reply_error(client, "invalid id");
+            return;
+        }
+        xSemaphoreTake(bus_mutex, portMAX_DELAY);
+        bool ok = feetech_switch_id(old_id, new_id);
+        xSemaphoreGive(bus_mutex);
+        JsonDocument doc;
+        doc["ok"] = ok;
+        if (!ok) doc["err"] = "EEPROM write failed — check wiring or try again";
+        String out;
+        serializeJson(doc, out);
+        client->text(out);
         return;
     }
 

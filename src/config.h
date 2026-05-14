@@ -1,8 +1,8 @@
 #pragma once
 
 // --- WiFi ---
-#define WIFI_SSID "your-wifi-ssid"
-#define WIFI_PASS "your-wifi-password"
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASS "your-password"
 
 // --- T-CAN485 RS-485 pins (from official Xinyuan-LilyGO/T-CAN485 config.h) ---
 // The built-in SP3485 transceiver acts as the half-duplex buffer for the servo bus.

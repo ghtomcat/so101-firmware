@@ -235,6 +235,29 @@ bool feetech_write_torque(uint8_t id, bool enable) {
     return recv_packet(id, buf) >= 0;
 }
 
+bool feetech_switch_id(uint8_t old_id, uint8_t new_id) {
+    // STS3215 EEPROM: Lock=55 (0x37), ID=5 (0x05)
+    uint8_t buf[4];
+
+    // Unlock EEPROM — ACK arrives from old_id.
+    uint8_t unlock[2] = {55, 0};
+    send_packet(old_id, INST_WRITE, unlock, 2);
+    if (recv_packet(old_id, buf, 20) < 0) return false;
+
+    // Write new ID — the servo switches its ID before sending the ACK,
+    // so the response arrives from new_id. We drain whatever comes back
+    // (may time out if the servo doesn't respond) and verify via the
+    // re-lock ACK below.
+    uint8_t set_id[2] = {5, new_id};
+    send_packet(old_id, INST_WRITE, set_id, 2);
+    recv_packet(new_id, buf, 20); // best-effort; ignore result
+
+    // Re-lock EEPROM — confirmed ACK from new_id proves the rename succeeded.
+    uint8_t relock[2] = {55, 1};
+    send_packet(new_id, INST_WRITE, relock, 2);
+    return recv_packet(new_id, buf, 20) >= 0;
+}
+
 bool feetech_torque_all(const uint8_t *ids, uint8_t count, bool enable) {
     // SYNC_WRITE torque enable register (0x28) for all servos in one packet.
     // params = [start_addr, data_len_per_servo, ID0, val0, ID1, val1, ...]

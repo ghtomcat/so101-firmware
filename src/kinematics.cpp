@@ -149,6 +149,106 @@ void fk_compute(const float angles_deg[SERVO_COUNT], FkResult *out) {
     out->nodes[7] = mpos(T);
 }
 
+Vec3 fk_tcp(const float angles_deg[SERVO_COUNT]) {
+    FkResult fk;
+    fk_compute(angles_deg, &fk);
+    return fk.nodes[7];
+}
+
+// ---------------------------------------------------------------------------
+// 3×3 Gaussian elimination (partial pivoting) — solves A*x = b in place.
+// ---------------------------------------------------------------------------
+
+static void mat3_gauss(float A[3][3], float b[3], float x[3]) {
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        for (int row = col + 1; row < 3; row++)
+            if (fabsf(A[row][col]) > fabsf(A[pivot][col])) pivot = row;
+        for (int k = 0; k < 3; k++) { float t = A[col][k]; A[col][k] = A[pivot][k]; A[pivot][k] = t; }
+        { float t = b[col]; b[col] = b[pivot]; b[pivot] = t; }
+        for (int row = col + 1; row < 3; row++) {
+            if (fabsf(A[col][col]) < 1e-12f) continue;
+            float f = A[row][col] / A[col][col];
+            for (int k = col; k < 3; k++) A[row][k] -= f * A[col][k];
+            b[row] -= f * b[col];
+        }
+    }
+    for (int i = 2; i >= 0; i--) {
+        x[i] = b[i];
+        for (int j = i + 1; j < 3; j++) x[i] -= A[i][j] * x[j];
+        x[i] = (fabsf(A[i][i]) > 1e-12f) ? x[i] / A[i][i] : 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IK — damped least squares, position only
+// ---------------------------------------------------------------------------
+
+bool ik_solve(const float current_deg[SERVO_COUNT], Vec3 target,
+              float result_deg[SERVO_COUNT], int max_iter, float tol_m) {
+    const float DELTA_DEG     = 0.5f;   // finite-difference step (degrees)
+    const float LAMBDA        = 0.05f;  // DLS damping factor (meters)
+    const float MAX_STEP_DEG  = 10.0f;  // joint change clamped per iteration
+
+    float q[SERVO_COUNT];
+    for (int i = 0; i < SERVO_COUNT; i++) q[i] = current_deg[i];
+
+    const float inv_delta_rad = 1.0f / (DELTA_DEG * DEG2RAD); // (m/rad)⁻¹ factor
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        FkResult fk0;
+        fk_compute(q, &fk0);
+        Vec3 tcp = fk0.nodes[7];
+
+        float ep[3] = { target.x - tcp.x, target.y - tcp.y, target.z - tcp.z };
+        if (ep[0]*ep[0] + ep[1]*ep[1] + ep[2]*ep[2] < tol_m * tol_m) break;
+
+        // Numerical Jacobian J[3][SERVO_COUNT] in m/rad
+        float J[3][SERVO_COUNT];
+        for (int j = 0; j < SERVO_COUNT; j++) {
+            float qp[SERVO_COUNT];
+            for (int k = 0; k < SERVO_COUNT; k++) qp[k] = q[k];
+            qp[j] += DELTA_DEG;
+            FkResult fk1;
+            fk_compute(qp, &fk1);
+            J[0][j] = (fk1.nodes[7].x - tcp.x) * inv_delta_rad;
+            J[1][j] = (fk1.nodes[7].y - tcp.y) * inv_delta_rad;
+            J[2][j] = (fk1.nodes[7].z - tcp.z) * inv_delta_rad;
+        }
+
+        // A = J Jᵀ + λ²I  (3×3)
+        float lsq = LAMBDA * LAMBDA;
+        float A[3][3];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) {
+                float s = (r == c) ? lsq : 0.0f;
+                for (int k = 0; k < SERVO_COUNT; k++) s += J[r][k] * J[c][k];
+                A[r][c] = s;
+            }
+
+        // Solve A * v = ep
+        float b[3] = { ep[0], ep[1], ep[2] };
+        float v[3];
+        mat3_gauss(A, b, v);
+
+        // dq = Jᵀ v  (rad → deg, clamped)
+        for (int j = 0; j < SERVO_COUNT; j++) {
+            float dq_deg = (J[0][j]*v[0] + J[1][j]*v[1] + J[2][j]*v[2]) / DEG2RAD;
+            if (dq_deg >  MAX_STEP_DEG) dq_deg =  MAX_STEP_DEG;
+            if (dq_deg < -MAX_STEP_DEG) dq_deg = -MAX_STEP_DEG;
+            q[j] += dq_deg;
+        }
+    }
+
+    for (int i = 0; i < SERVO_COUNT; i++) result_deg[i] = q[i];
+
+    Vec3 final_tcp = fk_tcp(result_deg);
+    float ex = target.x - final_tcp.x;
+    float ey = target.y - final_tcp.y;
+    float ez = target.z - final_tcp.z;
+    return (ex*ex + ey*ey + ez*ez) < tol_m * tol_m;
+}
+
 bool fk_check(const float angles_deg[SERVO_COUNT], char *reason_out) {
     FkResult fk;
     fk_compute(angles_deg, &fk);
